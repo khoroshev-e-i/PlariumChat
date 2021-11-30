@@ -1,11 +1,11 @@
 ﻿using Gateway.Settings;
-using Microsoft.Extensions.Configuration;
 using Newtonsoft.Json;
 using Shared;
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.IO;
+using System.Linq;
 using System.Net;
 using System.Net.Sockets;
 using System.Text;
@@ -22,16 +22,12 @@ namespace Gateway
 
         static void Main(string[] args)
         {
-            var configuration = (IConfiguration)new ConfigurationBuilder()
-                .SetBasePath(Directory.GetParent(AppContext.BaseDirectory).FullName)
-                .AddJsonFile("appsettings.json", false)
-                .Build();
-            configuration.Bind(nameof(GatewaySettings), GatewaySettings);
+            AppDomain.CurrentDomain.ProcessExit += new EventHandler(CurrentDomain_ProcessExit);
+            GatewaySettings = ConfigurationHelper.GetSettings<GatewaySettings>();
 
             try
             {
-
-               Task.Run(async () => await ListenAsync()).ConfigureAwait(false).GetAwaiter().GetResult();
+                Listen();
             }
             catch { }
             finally
@@ -43,18 +39,32 @@ namespace Gateway
             }
         }
 
-        public async static Task ListenAsync()
+        private static void CurrentDomain_ProcessExit(object sender, EventArgs e)
+        {
+            foreach (var c in Connections.Values)
+            {
+                try
+                {
+                    c.Dispose();
+                }
+                catch { }
+            }
+        }
+
+        public static void Listen()
         {
             var ip = new IPAddress(GatewaySettings.Host);
             var listener = new TcpListener(ip, GatewaySettings.Port);
 
             listener.Start();
+            Console.WriteLine("Сервер чата запущен.");
             while (true)
             {
                 var thread = new Thread(async () =>
                 {
                     using var client = await listener.AcceptTcpClientAsync();
                     var username = await ReadGreetingAsync(client);
+                    await SendGreetingAsync(client);
 
                     Connections.GetOrAdd(username, client);
                     await ReadClientDataAsync(client, username);
@@ -62,28 +72,37 @@ namespace Gateway
 
                 thread.Start();
             }
+        }
 
+        private async static Task SendGreetingAsync(TcpClient client)
+        {
+            var messages = Messages.ToArray().Select(x => $"{x.Key}:{x.Value}");
+            var message = string.Join("\n", messages);
+            message = string.IsNullOrWhiteSpace(message) ? $"{Constants.SystemMessageCaption}: Чат пуст." : message;
+
+            await SendMessage(client.GetStream(), message);
         }
 
         private async static Task<string> ReadGreetingAsync(TcpClient client)
         {
             var stream = client.GetStream();
             var buffer = new byte[GatewaySettings.BufferSize];
+
             await stream.FlushAsync();
             await stream.ReadAsync(buffer);
             await stream.FlushAsync();
 
             var serialized = Encoding.UTF8.GetString(buffer);
             var greet = JsonConvert.DeserializeObject<Greeting>(serialized);
+            var message = $"{greet.Username} вошел в чат.";
 
-            Console.WriteLine($"[System] -- {greet.Username} вошел в чат.");
+            SendToOthers(new KeyValuePair<string, string>(Constants.SystemMessageCaption, message));
 
             return greet.Username;
         }
 
         private static async Task ReadClientDataAsync(TcpClient client, string username)
         {
-            var counter = 0;
             var stream = client.GetStream();
 
             try
@@ -98,23 +117,21 @@ namespace Gateway
                     var message = Encoding.UTF8.GetString(bytes, 0, bytesCount);
 
                     Enqueue(message);
-
-                    Console.WriteLine($"\t{username}: {message}");
                     SendToOthers(new KeyValuePair<string, string>(username, message));
-
-                    //// Send back a response.
-                    //stream.Write(msg, 0, msg.Length);
-                    //Console.WriteLine("Sent: {0}", data);
                 }
             }
             catch (Exception e)
             {
-                Console.WriteLine("Ошибка при чтении сообщения от клиента: {}");
+                var message = $"{username} вышел из чата.";
+                Console.WriteLine($"{Constants.SystemMessageCaption} -- {message}");
+                Connections.TryRemove(username, out var conn);
+                conn?.Dispose();
+                SendToOthers(new KeyValuePair<string, string>(Constants.SystemMessageCaption, message));
             }
 
             void Enqueue(string message)
             {
-                if (Messages.Count == GatewaySettings.HistorySize)
+                if (Messages.Count >= GatewaySettings.HistorySize)
                 {
                     Messages.TryDequeue(out _);
                 }
@@ -126,8 +143,8 @@ namespace Gateway
         {
             Parallel.ForEach(Connections.Keys, async (username) =>
             {
-                if (Connections.TryGetValue(username, out var connection))
-                    await SendMessage(connection.GetStream(), $"\t{message.Key}: {message.Value}");
+                if (Connections.TryGetValue(username, out var connection) && message.Key != username)
+                    await SendMessage(connection.GetStream(), $"{message.Key}: {message.Value}");
             });
         }
 
@@ -141,12 +158,6 @@ namespace Gateway
             await stream.FlushAsync();
             await stream.WriteAsync(bytes, 0, length);
             await stream.FlushAsync();
-        }
-
-        private static void OnClientConnected(IAsyncResult asyncResult)
-        {
-            var listener = asyncResult.AsyncState;
-
         }
     }
 }
